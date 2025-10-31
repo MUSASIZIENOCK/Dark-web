@@ -1,0 +1,220 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Dark Web Market - Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { background:#0b0b0f; color:#eee; font-family:system-ui,Segoe UI,Roboto; padding:16px; }
+    .card { background:#121216; padding:12px; border-radius:8px; margin-bottom:12px; }
+    input, button { padding:8px; border-radius:6px; border:1px solid #222; background:#0b0b0f; color:#eee; }
+    button { cursor:pointer; }
+    .row { display:flex; gap:8px; align-items:center; }
+    .chat { max-width:720px; margin-top:12px; }
+    .msg { padding:8px; border-radius:8px; margin:6px 0; background:#1b1b1f; }
+  </style>
+  <script src="https://unpkg.com/libsodium-wrappers/dist/libsodium-wrappers.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <h1>Dark Web Market — Demo</h1>
+  <div class="card">
+    <h3>Create account (pay $100)</h3>
+    <div class="row">
+      <input id="email" placeholder="email@example.com" />
+      <button id="payBtn">Pay $100 (Checkout)</button>
+    </div>
+    <p id="payInfo"></p>
+  </div>
+
+  <div class="card">
+    <h3>Login</h3>
+    <div class="row">
+      <input id="loginEmail" placeholder="email to login" />
+      <button id="loginBtn">Login</button>
+    </div>
+    <p id="loginInfo"></p>
+  </div>
+
+  <div id="setupKeys" class="card" style="display:none">
+    <h3>Keypair & Privacy</h3>
+    <p>Download and keep your private key securely. The private key is not stored on server in this demo.</p>
+    <div class="row">
+      <button id="genKeys">Generate Keypair</button>
+      <button id="uploadPub">Upload Public Key</button>
+      <a id="downloadKey" style="display:none">Download private key</a>
+    </div>
+    <pre id="pubKeyBox"></pre>
+  </div>
+
+  <div id="chatArea" class="card" style="display:none">
+    <h3>Chat (encrypted)</h3>
+    <div class="row">
+      <input id="otherId" placeholder="other user's id (paste from login response)" />
+      <button id="startConv">Start Conversation</button>
+    </div>
+
+    <div id="convArea" style="display:none">
+      <div class="chat" id="messages"></div>
+      <div class="row">
+        <input id="messageInput" placeholder="Write a message (plaintext will be encrypted)" style="flex:1" />
+        <button id="sendMessage">Send</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(async () => {
+  const payBtn = document.getElementById("payBtn");
+  const payInfo = document.getElementById("payInfo");
+  const emailInput = document.getElementById("email");
+  const loginBtn = document.getElementById("loginBtn");
+  const loginEmail = document.getElementById("loginEmail");
+  const loginInfo = document.getElementById("loginInfo");
+  const setupKeys = document.getElementById("setupKeys");
+  const genKeysBtn = document.getElementById("genKeys");
+  const uploadPubBtn = document.getElementById("uploadPub");
+  const pubKeyBox = document.getElementById("pubKeyBox");
+  const downloadKey = document.getElementById("downloadKey");
+  const chatArea = document.getElementById("chatArea");
+  const otherIdInput = document.getElementById("otherId");
+  const startConvBtn = document.getElementById("startConv");
+  const convArea = document.getElementById("convArea");
+  const messagesDiv = document.getElementById("messages");
+  const msgInput = document.getElementById("messageInput");
+  const sendMsgBtn = document.getElementById("sendMessage");
+
+  // libsodium
+  await sodium.ready;
+  const sodiumLib = sodium;
+
+  let jwtToken = null;
+  let me = null;
+  let privateKeyB64 = null;
+  let publicKeyB64 = null;
+  let socket = null;
+  let convId = null;
+  let otherUserId = null;
+
+  payBtn.addEventListener("click", async () => {
+    const email = emailInput.value.trim().toLowerCase();
+    if (!email) { payInfo.textContent = "Enter email"; return; }
+    payInfo.textContent = "Creating checkout...";
+    const rsp = await fetch("/api/create-checkout", { method: "POST", headers: {'content-type':'application/json'}, body: JSON.stringify({ email })});
+    const j = await rsp.json();
+    if (j.url) {
+      // redirect user to checkout; for mock flow this page will activate immediately
+      window.open(j.url, "_blank");
+      payInfo.innerHTML = `Opened checkout. After paying, login with your email.`;
+    } else {
+      payInfo.textContent = "Error creating checkout: " + (j.error || "unknown");
+    }
+  });
+
+  loginBtn.addEventListener("click", async () => {
+    const email = loginEmail.value.trim().toLowerCase();
+    if (!email) { loginInfo.textContent = "enter email"; return; }
+    const rsp = await fetch("/api/login", { method: "POST", headers: {'content-type':'application/json'}, body: JSON.stringify({ email })});
+    const j = await rsp.json();
+    if (rsp.ok) {
+      jwtToken = j.token;
+      me = j.user;
+      loginInfo.textContent = `Logged in as ${me.email}. id=${me.id}`;
+      setupKeys.style.display = "block";
+      chatArea.style.display = "block";
+      // init socket
+      socket = io();
+      socket.on("connect", () => {
+        socket.emit("auth", { token: jwtToken });
+      });
+      socket.on("auth:ok", ()=>console.log("socket auth ok"));
+      socket.on("message", async (m) => {
+        // decrypt message using privateKey and sender pubkey
+        const senderPub = (await fetch(`/api/user/${m.from}/pubkey`).then(r=>r.json())).publicKey;
+        if (!senderPub) {
+          appendMsg(`[ENCRYPTED] from ${m.from} (no pubkey)`);
+          return;
+        }
+        const plain = await decryptMessage(m.ciphertext, m.nonce, senderPub, privateKeyB64);
+        appendMsg(`${m.from}: ${plain}`);
+      });
+    } else {
+      loginInfo.textContent = `Login error: ${j.error || 'unknown'}`;
+    }
+  });
+
+  genKeysBtn.addEventListener("click", async () => {
+    const kp = sodiumLib.crypto_box_keypair();
+    publicKeyB64 = sodiumLib.to_base64(kp.publicKey);
+    privateKeyB64 = sodiumLib.to_base64(kp.privateKey);
+    pubKeyBox.textContent = "pub: " + publicKeyB64;
+    downloadKey.style.display = "inline";
+    downloadKey.href = URL.createObjectURL(new Blob([privateKeyB64], {type:'text/plain'}));
+    downloadKey.download = "darkweb_private_key.txt";
+  });
+
+  uploadPubBtn.addEventListener("click", async () => {
+    if (!publicKeyB64) return alert("generate keys first");
+    const rsp = await fetch("/api/me/pubkey", { method: "POST", headers: { 'content-type':'application/json', 'authorization': 'Bearer ' + jwtToken }, body: JSON.stringify({ publicKey: publicKeyB64 })});
+    const j = await rsp.json();
+    if (j.ok) alert("uploaded public key");
+  });
+
+  startConvBtn.addEventListener("click", async () => {
+    otherUserId = otherIdInput.value.trim();
+    if (!otherUserId) return alert("enter other user id");
+    // create conversation
+    const r = await fetch("/api/conversation", { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ a: me.id, b: otherUserId })});
+    const j = await r.json();
+    convId = j.id;
+    convArea.style.display = "block";
+    messagesDiv.innerHTML = "";
+    appendMsg("Conversation started: " + convId);
+  });
+
+  // encryption helpers
+  async function encryptMessage(plain, senderPrivB64, recipientPubB64) {
+    const senderPriv = sodiumLib.from_base64(senderPrivB64);
+    const recipientPub = sodiumLib.from_base64(recipientPubB64);
+    const nonce = sodiumLib.randombytes_buf(sodiumLib.crypto_box_NONCEBYTES);
+    const ct = sodiumLib.crypto_box_easy(plain, nonce, recipientPub, senderPriv);
+    return { ciphertext: sodiumLib.to_base64(ct), nonce: sodiumLib.to_base64(nonce) };
+  }
+  async function decryptMessage(ciphertextB64, nonceB64, senderPubB64, recipientPrivB64) {
+    const ct = sodiumLib.from_base64(ciphertextB64);
+    const nonce = sodiumLib.from_base64(nonceB64);
+    const senderPub = sodiumLib.from_base64(senderPubB64);
+    const recipientPriv = sodiumLib.from_base64(recipientPrivB64);
+    try {
+      const plainBuf = sodiumLib.crypto_box_open_easy(ct, nonce, senderPub, recipientPriv);
+      return sodiumLib.to_string(plainBuf);
+    } catch (e) {
+      return "[decryption failed]";
+    }
+  }
+
+  function appendMsg(text) {
+    const el = document.createElement("div");
+    el.className = "msg";
+    el.textContent = text;
+    messagesDiv.appendChild(el);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  }
+
+  sendMsgBtn.addEventListener("click", async () => {
+    const plain = msgInput.value.trim();
+    if (!plain) return;
+    // fetch recipient public key
+    const res = await fetch(`/api/user/${otherUserId}/pubkey`);
+    const j = await res.json();
+    if (!j.publicKey) return alert("recipient has no public key uploaded");
+    const enc = await encryptMessage(plain, privateKeyB64, j.publicKey);
+    socket.emit("send_message", { convId, to: otherUserId, ciphertext: enc.ciphertext, nonce: enc.nonce });
+    appendMsg("me: " + plain);
+    msgInput.value = "";
+  });
+
+})();
+</script>
+</body>
+</html>
